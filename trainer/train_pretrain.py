@@ -18,8 +18,9 @@ from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import (
     SkipBatchSampler,
     Logger,
-    get_deepspeed_checkpoint_dir,
+    build_model_config,
     get_deepspeed_zero_stage,
+    get_model_config_signature,
     get_lr,
     get_wandb_run_id,
     init_distributed_mode,
@@ -30,6 +31,7 @@ from trainer.trainer_utils import (
     load_deepspeed_training_checkpoint,
     save_deepspeed_training_checkpoint,
     save_full_weights,
+    save_model_config,
     setup_seed,
     sync_deepspeed_train_args,
 )
@@ -84,7 +86,7 @@ def maybe_save_pytorch_checkpoint(epoch, micro_step, total_steps, model, optimiz
     save_full_weights(model, args.save_dir, save_filename)
     lm_checkpoint(
         lm_config,
-        weight=args.save_weight,
+        weight=checkpoint_weight_name,
         model=model,
         optimizer=optimizer,
         scaler=scaler,
@@ -188,6 +190,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
+    parser.add_argument("--model_config", type=str, default=None, help="模型结构配置文件路径（config.json）")
+    parser.add_argument("--tokenizer_path", type=str, default="../model", help="tokenizer目录或HF模型名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
@@ -198,10 +202,26 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
+    parser.add_argument('--hidden_size', default=None, type=int, help="隐藏层维度，优先级高于model_config")
+    parser.add_argument('--intermediate_size', default=None, type=int, help="FFN中间层维度")
+    parser.add_argument('--num_hidden_layers', default=None, type=int, help="隐藏层数量，优先级高于model_config")
+    parser.add_argument('--num_attention_heads', default=None, type=int, help="注意力头数")
+    parser.add_argument('--num_key_value_heads', default=None, type=int, help="KV头数（GQA/MQA）")
+    parser.add_argument('--vocab_size', default=None, type=int, help="词表大小；默认会被tokenizer自动同步")
+    parser.add_argument('--max_position_embeddings', default=None, type=int, help="模型位置编码长度")
+    parser.add_argument('--hidden_act', default=None, type=str, help="激活函数")
+    parser.add_argument('--dropout', default=None, type=float, help="dropout比例")
+    parser.add_argument('--rope_theta', default=None, type=float, help="RoPE基数")
+    parser.add_argument('--flash_attn', default=None, type=int, choices=[0, 1], help="是否开启SDPA/Flash Attention路径")
+    parser.add_argument('--bos_token_id', default=None, type=int, help="BOS token id；默认从tokenizer同步")
+    parser.add_argument('--eos_token_id', default=None, type=int, help="EOS token id；默认从tokenizer同步")
+    parser.add_argument('--pad_token_id', default=None, type=int, help="PAD token id；默认从tokenizer同步")
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--use_moe', default=None, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--num_experts_per_tok', default=None, type=int, help="每个token激活的专家数")
+    parser.add_argument('--n_routed_experts', default=None, type=int, help="路由专家总数")
+    parser.add_argument('--n_shared_experts', default=None, type=int, help="共享专家数")
+    parser.add_argument('--aux_loss_alpha', default=None, type=float, help="MoE辅助loss权重")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -233,9 +253,7 @@ if __name__ == "__main__":
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    save_filename = f'{args.save_weight}_{lm_config.hidden_size}{"_moe" if lm_config.use_moe else ""}.pth'
-    ds_checkpoint_dir = get_deepspeed_checkpoint_dir(lm_config, weight=args.save_weight, save_dir=args.ds_ckpt_dir)
+    lm_config = build_model_config(args)
 
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -243,7 +261,21 @@ if __name__ == "__main__":
     autocast_ctx = nullcontext() if args.use_deepspeed == 1 or device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
 
     # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, move_to_device=(args.use_deepspeed == 0))
+    model, tokenizer = init_model(
+        lm_config,
+        args.from_weight,
+        tokenizer_path=args.tokenizer_path,
+        device=args.device,
+        move_to_device=(args.use_deepspeed == 0)
+    )
+    model_signature = get_model_config_signature(lm_config)
+    checkpoint_weight_name = f'{args.save_weight}_{model_signature}'
+    save_filename = f'{checkpoint_weight_name}.pth'
+    config_filename = f'{checkpoint_weight_name}.json'
+    ds_checkpoint_dir = os.path.join(args.ds_ckpt_dir, checkpoint_weight_name)
+    if is_main_process():
+        saved_config_path = save_model_config(lm_config, args.save_dir, config_filename)
+        Logger(f'已保存本次训练使用的模型配置: {saved_config_path}')
     if args.use_compile == 1 and args.use_deepspeed == 0:
         model = torch.compile(model)
         Logger('torch.compile enabled')
@@ -274,7 +306,7 @@ if __name__ == "__main__":
                 if saved_ws is not None and saved_ws != current_ws and is_main_process():
                     Logger(f'DeepSpeed检查点 world_size={saved_ws}，当前 world_size={current_ws}，请确认该恢复流程兼容当前并行规模')
     else:
-        ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
+        ckp_data = lm_checkpoint(lm_config, weight=checkpoint_weight_name, save_dir='../checkpoints') if args.from_resume == 1 else None
         if ckp_data:
             model.load_state_dict(ckp_data['model'])
             optimizer.load_state_dict(ckp_data['optimizer'])

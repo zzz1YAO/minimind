@@ -61,7 +61,49 @@ ds_report
 cat part*.jsonl > pretrain.jsonl
 ```
 
-### 3.2 先跑 ZeRO-2
+### 3.2 先准备模型结构配置和 tokenizer
+
+这次改动后，`trainer/train_pretrain.py` 已经支持：
+
+- `--model_config`：从一个 `config.json` 读取 Transformer 结构参数
+- `--tokenizer_path`：指定 tokenizer 目录或 Hugging Face 模型名
+- 命令行 override：如果你同时传了 `--hidden_size` 之类的参数，命令行优先级更高
+
+建议做法是：
+
+1. 先把模型结构放进一个 `config.json`
+2. 再明确指定训练要用的 tokenizer
+3. 让脚本在训练开始时自动把 `vocab_size`、`bos/eos/pad_token_id` 和 tokenizer 对齐
+
+一个最小例子：
+
+```json
+{
+  "hidden_size": 1024,
+  "num_hidden_layers": 16,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 4,
+  "max_position_embeddings": 32768,
+  "use_moe": false
+}
+```
+
+如果你打算用 Qwen2 tokenizer，建议直接传：
+
+```bash
+--tokenizer_path /path/to/Qwen2-tokenizer
+```
+
+这时脚本会按 tokenizer 自动同步：
+
+- `vocab_size`
+- `bos_token_id`
+- `eos_token_id`
+- `pad_token_id`
+
+训练开始后，脚本还会把**本次真正生效的模型配置**保存到输出目录，方便你后续转成 HF 格式。
+
+### 3.3 先跑 ZeRO-2
 
 这是推荐的第一步。
 
@@ -69,6 +111,8 @@ cat part*.jsonl > pretrain.jsonl
 deepspeed trainer/train_pretrain.py \
   --use_deepspeed 1 \
   --ds_config configs/deepspeed/pretrain_zero2_2x48.json \
+  --model_config configs/model/pretrain_1b.json \
+  --tokenizer_path /path/to/tokenizer \
   --data_path ../dataset/pretrain.jsonl
 ```
 
@@ -79,7 +123,24 @@ deepspeed trainer/train_pretrain.py \
 - checkpoint 能保存
 - resume 能恢复
 
-### 3.3 再考虑 ZeRO-3
+如果你只是想临时覆盖某个结构参数，也可以直接在命令里加，例如：
+
+```bash
+deepspeed trainer/train_pretrain.py \
+  --use_deepspeed 1 \
+  --ds_config configs/deepspeed/pretrain_zero2_2x48.json \
+  --model_config configs/model/pretrain_1b.json \
+  --tokenizer_path /path/to/tokenizer \
+  --num_hidden_layers 20 \
+  --data_path ../dataset/pretrain.jsonl
+```
+
+这里的效果是：
+
+- 大部分结构参数从 `config.json` 读取
+- `num_hidden_layers` 由命令行覆盖为 `20`
+
+### 3.4 再考虑 ZeRO-3
 
 如果显存还是不够，再切到：
 
@@ -87,6 +148,8 @@ deepspeed trainer/train_pretrain.py \
 deepspeed trainer/train_pretrain.py \
   --use_deepspeed 1 \
   --ds_config configs/deepspeed/pretrain_zero3_2x48.json \
+  --model_config configs/model/pretrain_1b.json \
+  --tokenizer_path /path/to/tokenizer \
   --data_path ../dataset/pretrain.jsonl
 ```
 
@@ -253,6 +316,8 @@ DeepSpeed 调参时，最好只改一个变量：
 deepspeed trainer/train_pretrain.py \
   --use_deepspeed 1 \
   --ds_config configs/deepspeed/pretrain_zero2_2x48.json \
+  --model_config configs/model/pretrain_1b.json \
+  --tokenizer_path /path/to/tokenizer \
   --data_path ../dataset/pretrain.jsonl
 ```
 
@@ -263,6 +328,8 @@ deepspeed trainer/train_pretrain.py \
   --use_deepspeed 1 \
   --from_resume 1 \
   --ds_config configs/deepspeed/pretrain_zero2_2x48.json \
+  --model_config configs/model/pretrain_1b.json \
+  --tokenizer_path /path/to/tokenizer \
   --data_path ../dataset/pretrain.jsonl
 ```
 

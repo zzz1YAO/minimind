@@ -14,7 +14,26 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
-from model.model_minimind import MiniMindForCausalLM
+from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+
+MODEL_CONFIG_DEFAULTS = {
+    'hidden_size': 512,
+    'intermediate_size': None,
+    'max_position_embeddings': 32768,
+    'num_attention_heads': 8,
+    'num_hidden_layers': 8,
+    'num_key_value_heads': 2,
+    'vocab_size': 6400,
+    'hidden_act': 'silu',
+    'dropout': 0.0,
+    'rope_theta': 1000000.0,
+    'flash_attn': True,
+    'use_moe': False,
+    'num_experts_per_tok': 2,
+    'n_routed_experts': 4,
+    'n_shared_experts': 1,
+    'aux_loss_alpha': 0.01,
+}
 
 def get_model_params(model, config):
     total = sum(p.numel() for p in model.parameters()) / 1e6
@@ -98,6 +117,101 @@ def is_deepspeed_active(model):
 def load_json_config(config_path):
     with open(config_path, 'r', encoding='utf-8') as f:
         return json.load(f)
+
+
+def build_model_config(args):
+    config_data = load_json_config(args.model_config) if getattr(args, 'model_config', None) else {}
+    model_kwargs = dict(MODEL_CONFIG_DEFAULTS)
+    model_kwargs.update(config_data)
+
+    arg_overrides = {
+        'hidden_size': getattr(args, 'hidden_size', None),
+        'intermediate_size': getattr(args, 'intermediate_size', None),
+        'max_position_embeddings': getattr(args, 'max_position_embeddings', None),
+        'num_attention_heads': getattr(args, 'num_attention_heads', None),
+        'num_hidden_layers': getattr(args, 'num_hidden_layers', None),
+        'num_key_value_heads': getattr(args, 'num_key_value_heads', None),
+        'vocab_size': getattr(args, 'vocab_size', None),
+        'hidden_act': getattr(args, 'hidden_act', None),
+        'dropout': getattr(args, 'dropout', None),
+        'rope_theta': getattr(args, 'rope_theta', None),
+        'flash_attn': None if getattr(args, 'flash_attn', None) is None else bool(args.flash_attn),
+        'use_moe': None if getattr(args, 'use_moe', None) is None else bool(args.use_moe),
+        'num_experts_per_tok': getattr(args, 'num_experts_per_tok', None),
+        'n_routed_experts': getattr(args, 'n_routed_experts', None),
+        'n_shared_experts': getattr(args, 'n_shared_experts', None),
+        'aux_loss_alpha': getattr(args, 'aux_loss_alpha', None),
+        'bos_token_id': getattr(args, 'bos_token_id', None),
+        'eos_token_id': getattr(args, 'eos_token_id', None),
+        'pad_token_id': getattr(args, 'pad_token_id', None),
+    }
+    for key, value in arg_overrides.items():
+        if value is not None:
+            model_kwargs[key] = value
+
+    return MiniMindConfig(**model_kwargs)
+
+
+def ensure_tokenizer_special_tokens(tokenizer):
+    if tokenizer.eos_token_id is None:
+        raise ValueError("tokenizer 必须提供 eos_token_id，当前预训练数据管线依赖它")
+
+    if tokenizer.bos_token_id is None:
+        tokenizer.bos_token = tokenizer.eos_token
+        Logger('tokenizer 未设置 bos_token，已回退到 eos_token')
+
+    if tokenizer.pad_token_id is None:
+        fallback_token = tokenizer.eos_token or tokenizer.bos_token
+        tokenizer.pad_token = fallback_token
+        Logger('tokenizer 未设置 pad_token，已回退到 eos_token/bos_token')
+
+    return tokenizer
+
+
+def sync_model_config_with_tokenizer(lm_config, tokenizer):
+    tokenizer = ensure_tokenizer_special_tokens(tokenizer)
+    tokenizer_vocab_size = len(tokenizer)
+
+    if lm_config.vocab_size != tokenizer_vocab_size:
+        Logger(f'vocab_size 从 {lm_config.vocab_size} 同步为 tokenizer 词表大小 {tokenizer_vocab_size}')
+        lm_config.vocab_size = tokenizer_vocab_size
+
+    for attr_name in ('bos_token_id', 'eos_token_id', 'pad_token_id'):
+        tokenizer_value = getattr(tokenizer, attr_name, None)
+        if tokenizer_value is None:
+            continue
+        if getattr(lm_config, attr_name, None) != tokenizer_value:
+            Logger(f'{attr_name} 从 {getattr(lm_config, attr_name, None)} 同步为 tokenizer 的 {tokenizer_value}')
+            setattr(lm_config, attr_name, tokenizer_value)
+
+    return lm_config, tokenizer
+
+
+def get_model_config_signature(lm_config):
+    parts = [
+        f'h{lm_config.hidden_size}',
+        f'l{lm_config.num_hidden_layers}',
+        f'a{lm_config.num_attention_heads}',
+        f'kv{lm_config.num_key_value_heads}',
+        f'ffn{lm_config.intermediate_size}',
+        f'v{lm_config.vocab_size}',
+        f'ctx{lm_config.max_position_embeddings}',
+    ]
+    if lm_config.use_moe:
+        parts.extend([
+            f'moe{lm_config.n_routed_experts}',
+            f'topk{lm_config.num_experts_per_tok}',
+            f'shared{lm_config.n_shared_experts}',
+        ])
+    return '_'.join(parts)
+
+
+def save_model_config(lm_config, save_dir, save_filename='config.json'):
+    os.makedirs(save_dir, exist_ok=True)
+    config_path = os.path.join(save_dir, save_filename)
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(lm_config.to_dict(), f, indent=2, ensure_ascii=False)
+    return config_path
 
 
 def get_deepspeed_zero_stage(ds_config):
@@ -216,16 +330,26 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda', move_to_device=True):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    lm_config, tokenizer = sync_model_config_with_tokenizer(lm_config, tokenizer)
     model = MiniMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
-        weight_path = os.path.join(save_dir, f'{get_checkpoint_base_name(lm_config, from_weight)}.pth')
+        candidate_paths = []
+        if os.path.isfile(from_weight):
+            candidate_paths.append(from_weight)
+        if not from_weight.endswith('.pth'):
+            candidate_paths.append(os.path.join(save_dir, f'{from_weight}.pth'))
+        candidate_paths.append(os.path.join(save_dir, f'{get_checkpoint_base_name(lm_config, from_weight)}.pth'))
+        weight_path = next((path for path in candidate_paths if os.path.exists(path)), None)
+        if weight_path is None:
+            raise FileNotFoundError(f'未找到待加载权重: from_weight={from_weight}, save_dir={save_dir}')
         map_location = device if move_to_device else 'cpu'
         weights = torch.load(weight_path, map_location=map_location)
         model.load_state_dict(weights, strict=False)
 
     get_model_params(model, lm_config)
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
+    Logger(f'Tokenizer Path: {tokenizer_path}')
     if move_to_device:
         model = model.to(device)
     return model, tokenizer

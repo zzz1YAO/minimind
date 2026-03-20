@@ -17,6 +17,7 @@ class MiniMindConfig(PretrainedConfig):
             hidden_size: int = 512,
             intermediate_size: int = None,
             max_position_embeddings: int = 32768,
+            max_seq_len: int = None,
             num_attention_heads: int = 8,
             num_hidden_layers: int = 8,
             num_key_value_heads: int = 2,
@@ -40,6 +41,36 @@ class MiniMindConfig(PretrainedConfig):
             **kwargs
     ):
         super().__init__(**kwargs)
+        if max_seq_len is not None:
+            max_position_embeddings = max_seq_len
+        if hidden_size <= 0:
+            raise ValueError("hidden_size 必须大于 0")
+        if num_hidden_layers <= 0:
+            raise ValueError("num_hidden_layers 必须大于 0")
+        if vocab_size <= 0:
+            raise ValueError("vocab_size 必须大于 0")
+        if num_attention_heads <= 0:
+            raise ValueError("num_attention_heads 必须大于 0")
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError("hidden_size 必须能被 num_attention_heads 整除")
+        if num_key_value_heads is not None:
+            if num_key_value_heads <= 0:
+                raise ValueError("num_key_value_heads 必须大于 0")
+            if num_attention_heads % num_key_value_heads != 0:
+                raise ValueError("num_attention_heads 必须能被 num_key_value_heads 整除")
+        if intermediate_size is not None and intermediate_size <= 0:
+            raise ValueError("intermediate_size 必须大于 0")
+        if max_position_embeddings <= 0:
+            raise ValueError("max_position_embeddings 必须大于 0")
+        if use_moe:
+            if n_routed_experts <= 0:
+                raise ValueError("use_moe=True 时 n_routed_experts 必须大于 0")
+            if num_experts_per_tok <= 0:
+                raise ValueError("use_moe=True 时 num_experts_per_tok 必须大于 0")
+            if num_experts_per_tok > n_routed_experts:
+                raise ValueError("num_experts_per_tok 不能大于 n_routed_experts")
+            if n_shared_experts < 0:
+                raise ValueError("n_shared_experts 不能小于 0")
         self.dropout = dropout
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
