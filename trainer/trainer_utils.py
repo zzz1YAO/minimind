@@ -5,6 +5,7 @@ import os
 import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import json
 import random
 import math
 import numpy as np
@@ -41,12 +42,16 @@ def get_lr(current_step, total_steps, lr):
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 
-def init_distributed_mode():
+def init_distributed_mode(local_rank=None, backend="nccl"):
+    if dist.is_initialized():
+        return int(os.environ.get("LOCAL_RANK", local_rank if local_rank is not None else 0))
+
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
 
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend=backend)
+    if local_rank is None:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     return local_rank
 
@@ -60,27 +65,120 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def unwrap_model(model):
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    return getattr(raw_model, '_orig_mod', raw_model)
+
+
+def get_checkpoint_base_name(lm_config, weight='full_sft'):
+    moe_suffix = '_moe' if lm_config.use_moe else ''
+    return f'{weight}_{lm_config.hidden_size}{moe_suffix}'
+
+
+def get_checkpoint_paths(lm_config, weight='full_sft', save_dir='../checkpoints'):
+    base_name = get_checkpoint_base_name(lm_config, weight)
+    return {
+        'base_name': base_name,
+        'weight_path': os.path.join(save_dir, f'{base_name}.pth'),
+        'resume_path': os.path.join(save_dir, f'{base_name}_resume.pth'),
+    }
+
+
+def get_deepspeed_checkpoint_dir(lm_config, weight='pretrain', save_dir='../checkpoints_ds'):
+    return os.path.join(save_dir, get_checkpoint_base_name(lm_config, weight))
+
+
+def is_deepspeed_active(model):
+    class_name = model.__class__.__name__.lower()
+    module_name = model.__class__.__module__.lower()
+    return 'deepspeed' in class_name or 'deepspeed' in module_name
+
+
+def load_json_config(config_path):
+    with open(config_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def get_deepspeed_zero_stage(ds_config):
+    if isinstance(ds_config, str):
+        ds_config = load_json_config(ds_config)
+    zero_optimization = ds_config.get('zero_optimization', {})
+    if isinstance(zero_optimization, bool):
+        return int(zero_optimization)
+    return int(zero_optimization.get('stage', 0))
+
+
+def sync_deepspeed_train_args(args, ds_config):
+    if isinstance(ds_config, str):
+        ds_config = load_json_config(ds_config)
+
+    micro_batch = ds_config.get('train_micro_batch_size_per_gpu')
+    grad_acc = ds_config.get('gradient_accumulation_steps')
+
+    if micro_batch is not None and args.batch_size != micro_batch:
+        Logger(f'DeepSpeed train_micro_batch_size_per_gpu={micro_batch}，覆盖 batch_size={args.batch_size}')
+        args.batch_size = micro_batch
+
+    if grad_acc is not None and args.accumulation_steps != grad_acc:
+        Logger(f'DeepSpeed gradient_accumulation_steps={grad_acc}，覆盖 accumulation_steps={args.accumulation_steps}')
+        args.accumulation_steps = grad_acc
+
+    return args
+
+
+def get_wandb_run_id(wandb):
+    if wandb is None:
+        return None
+    if hasattr(wandb, 'get_run'):
+        run = wandb.get_run()
+        return getattr(run, 'id', None) if run else None
+    return getattr(wandb, 'id', None)
+
+
+def save_full_weights(model, save_dir, save_filename):
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, save_filename)
+
+    if is_deepspeed_active(model):
+        saved = model.save_16bit_model(save_dir, save_filename=save_filename)
+        return save_path if saved else None
+
+    state_dict = unwrap_model(model).state_dict()
+    state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
+    ckp_tmp = save_path + '.tmp'
+    torch.save(state_dict, ckp_tmp)
+    os.replace(ckp_tmp, save_path)
+    del state_dict
+    return save_path
+
+
+def save_deepspeed_training_checkpoint(model_engine, checkpoint_dir, tag=None, client_state=None):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    return model_engine.save_checkpoint(checkpoint_dir, tag=tag, client_state=client_state or {}, save_latest=True)
+
+
+def load_deepspeed_training_checkpoint(model_engine, checkpoint_dir, tag=None, **kwargs):
+    if not os.path.isdir(checkpoint_dir):
+        return None, None
+    if tag is None and not os.path.exists(os.path.join(checkpoint_dir, 'latest')):
+        return None, None
+    return model_engine.load_checkpoint(checkpoint_dir, tag=tag, **kwargs)
+
+
 def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
     os.makedirs(save_dir, exist_ok=True)
-    moe_path = '_moe' if lm_config.use_moe else ''
-    ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
-    resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
+    checkpoint_paths = get_checkpoint_paths(lm_config, weight, save_dir)
+    ckp_path = checkpoint_paths['weight_path']
+    resume_path = checkpoint_paths['resume_path']
 
     if model is not None:
-        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-        raw_model = getattr(raw_model, '_orig_mod', raw_model)
-        state_dict = raw_model.state_dict()
+        state_dict = unwrap_model(model).state_dict()
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
         ckp_tmp = ckp_path + '.tmp'
         torch.save(state_dict, ckp_tmp)
         os.replace(ckp_tmp, ckp_path)
-        wandb_id = None
-        if wandb:
-            if hasattr(wandb, 'get_run'):
-                run = wandb.get_run()
-                wandb_id = getattr(run, 'id', None) if run else None
-            else:
-                wandb_id = getattr(wandb, 'id', None)
+        wandb_id = get_wandb_run_id(wandb)
 
         resume_data = {
             'model': state_dict,
@@ -116,19 +214,21 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda', move_to_device=True):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniMindForCausalLM(lm_config)
 
     if from_weight!= 'none':
-        moe_suffix = '_moe' if lm_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        weights = torch.load(weight_path, map_location=device)
+        weight_path = os.path.join(save_dir, f'{get_checkpoint_base_name(lm_config, from_weight)}.pth')
+        map_location = device if move_to_device else 'cpu'
+        weights = torch.load(weight_path, map_location=map_location)
         model.load_state_dict(weights, strict=False)
 
     get_model_params(model, lm_config)
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
-    return model.to(device), tokenizer
+    if move_to_device:
+        model = model.to(device)
+    return model, tokenizer
 
 
 class SkipBatchSampler(Sampler):

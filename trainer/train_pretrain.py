@@ -10,33 +10,134 @@ import warnings
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
-from torch import optim, nn
+from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import (
+    SkipBatchSampler,
+    Logger,
+    get_deepspeed_checkpoint_dir,
+    get_deepspeed_zero_stage,
+    get_lr,
+    get_wandb_run_id,
+    init_distributed_mode,
+    init_model,
+    is_main_process,
+    lm_checkpoint,
+    load_json_config,
+    load_deepspeed_training_checkpoint,
+    save_deepspeed_training_checkpoint,
+    save_full_weights,
+    setup_seed,
+    sync_deepspeed_train_args,
+)
 
 warnings.filterwarnings('ignore')
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def require_deepspeed():
+    try:
+        import deepspeed
+    except ImportError as exc:
+        raise ImportError("DeepSpeed 未安装，请先参考 docs/deepspeed_setup.md 完成安装。") from exc
+    return deepspeed
+
+
+def init_wandb(resume_id=None):
+    if not args.use_wandb or not is_main_process():
+        return None
+
+    import swanlab as wandb
+
+    resume = 'must' if resume_id else None
+    wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+    wandb.init(project=args.wandb_project, name=wandb_run_name, id=resume_id, resume=resume)
+    return wandb
+
+
+def log_train_status(epoch, micro_step, total_steps, processed_steps, loss_value, aux_loss, current_lr, start_time, wandb=None):
+    spend_time = time.time() - start_time
+    current_logits_loss = loss_value - aux_loss
+    eta_min = spend_time / max(processed_steps, 1) * total_steps // 60 - spend_time // 60
+    Logger(
+        f'Epoch:[{epoch + 1}/{args.epochs}]({micro_step}/{total_steps}), '
+        f'loss: {loss_value:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {aux_loss:.4f}, '
+        f'lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min'
+    )
+    if wandb:
+        wandb.log({
+            "loss": loss_value,
+            "logits_loss": current_logits_loss,
+            "aux_loss": aux_loss,
+            "learning_rate": current_lr,
+            "epoch_time": eta_min
+        })
+
+
+def maybe_save_pytorch_checkpoint(epoch, micro_step, total_steps, model, optimizer, scaler, wandb):
+    if micro_step % args.save_interval != 0 and micro_step != total_steps:
+        return
+
+    model.eval()
+    save_full_weights(model, args.save_dir, save_filename)
+    lm_checkpoint(
+        lm_config,
+        weight=args.save_weight,
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        epoch=epoch,
+        step=micro_step,
+        wandb=wandb,
+        save_dir='../checkpoints'
+    )
+    model.train()
+
+
+def maybe_save_deepspeed_checkpoint(epoch, micro_step, total_steps, model_engine, wandb):
+    if micro_step % args.save_interval != 0 and micro_step != total_steps:
+        return
+    if not model_engine.is_gradient_accumulation_boundary():
+        return
+
+    model_engine.eval()
+    if args.save_full_weights == 1:
+        save_full_weights(model_engine, args.save_dir, save_filename)
+
+    client_state = {
+        'epoch': epoch,
+        'step': micro_step,
+        'world_size': dist.get_world_size() if dist.is_initialized() else 1,
+    }
+    wandb_id = get_wandb_run_id(wandb)
+    if wandb_id:
+        client_state['wandb_id'] = wandb_id
+
+    tag = f'epoch{epoch + 1}_step{micro_step}'
+    save_deepspeed_training_checkpoint(model_engine, ds_checkpoint_dir, tag=tag, client_state=client_state)
+    model_engine.train()
+
+
+def train_epoch_pytorch(epoch, loader, total_steps, start_step=0, wandb=None):
     start_time = time.time()
-    for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+    for processed_steps, (input_ids, labels) in enumerate(loader, start=1):
+        micro_step = start_step + processed_steps
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        lr = get_lr(epoch * total_steps + micro_step, args.epochs * total_steps, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
         with autocast_ctx:
             res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+            raw_loss = res.loss + res.aux_loss
+            loss = raw_loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if micro_step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
@@ -45,28 +146,41 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
             optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == iters - 1:
-            spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
+        if micro_step % args.log_interval == 0 or micro_step == total_steps:
+            current_loss = raw_loss.item()
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
-            current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            log_train_status(epoch, micro_step, total_steps, processed_steps, current_loss, current_aux_loss, current_lr, start_time, wandb)
 
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
-            model.eval()
-            moe_suffix = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
-            model.train()
-            del state_dict
+        if is_main_process():
+            maybe_save_pytorch_checkpoint(epoch, micro_step, total_steps, model, optimizer, scaler, wandb)
 
+        del input_ids, labels, res, loss, raw_loss
+
+
+def train_epoch_deepspeed(epoch, loader, total_steps, start_step=0, wandb=None):
+    start_time = time.time()
+    for processed_steps, (input_ids, labels) in enumerate(loader, start=1):
+        micro_step = start_step + processed_steps
+        input_ids = input_ids.to(args.device, non_blocking=True)
+        labels = labels.to(args.device, non_blocking=True)
+        lr = get_lr(epoch * total_steps + micro_step, args.epochs * total_steps, args.learning_rate)
+        if model.optimizer is not None:
+            for param_group in model.optimizer.param_groups:
+                param_group['lr'] = lr
+
+        res = model(input_ids, labels=labels)
+        loss = res.loss + res.aux_loss
+        model.backward(loss)
+        model.step()
+
+        if micro_step % args.log_interval == 0 or micro_step == total_steps:
+            current_loss = loss.item()
+            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            current_lr = model.optimizer.param_groups[-1]['lr'] if model.optimizer is not None else lr
+            log_train_status(epoch, micro_step, total_steps, processed_steps, current_loss, current_aux_loss, current_lr, start_time, wandb)
+
+        maybe_save_deepspeed_checkpoint(epoch, micro_step, total_steps, model, wandb)
         del input_ids, labels, res, loss
 
 
@@ -94,68 +208,106 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument("--use_deepspeed", default=0, type=int, choices=[0, 1], help="是否使用DeepSpeed训练（0=否，1=是）")
+    parser.add_argument("--ds_config", type=str, default="../configs/deepspeed/pretrain_zero2_2x48.json", help="DeepSpeed配置文件路径")
+    parser.add_argument("--ds_ckpt_dir", type=str, default="../checkpoints_ds", help="DeepSpeed检查点根目录")
+    parser.add_argument("--save_full_weights", default=1, type=int, choices=[0, 1], help="DeepSpeed分支是否额外导出单文件权重")
+    parser.add_argument("--local_rank", type=int, default=-1, help="分布式launcher兼容参数")
     args = parser.parse_args()
 
+    ds_config = load_json_config(args.ds_config) if args.use_deepspeed == 1 else None
+    zero_stage = get_deepspeed_zero_stage(ds_config) if ds_config is not None else 0
+    if ds_config is not None:
+        sync_deepspeed_train_args(args, ds_config)
+
     # ========== 1. 初始化环境和随机种子 ==========
-    local_rank = init_distributed_mode()
+    local_rank = init_distributed_mode(local_rank=args.local_rank if args.local_rank >= 0 else None)
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
+    if args.use_deepspeed == 1 and args.use_compile == 1:
+        args.use_compile = 0
+        Logger('DeepSpeed 模式下已禁用 torch.compile，以降低首版集成噪音')
+    if args.use_deepspeed == 1:
+        Logger(f'DeepSpeed enabled, ZeRO stage = {zero_stage}')
+
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
-    
+    save_filename = f'{args.save_weight}_{lm_config.hidden_size}{"_moe" if lm_config.use_moe else ""}.pth'
+    ds_checkpoint_dir = get_deepspeed_checkpoint_dir(lm_config, weight=args.save_weight, save_dir=args.ds_ckpt_dir)
+
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
-    # ========== 4. 配wandb ==========
-    wandb = None
-    if args.use_wandb and is_main_process():
-        import swanlab as wandb
-        wandb_id = ckp_data.get('wandb_id') if ckp_data else None
-        resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
+    autocast_ctx = nullcontext() if args.use_deepspeed == 1 or device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+
     # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    if args.use_compile == 1:
+    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, move_to_device=(args.use_deepspeed == 0))
+    if args.use_compile == 1 and args.use_deepspeed == 0:
         model = torch.compile(model)
         Logger('torch.compile enabled')
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16' and device_type == 'cuda')) if args.use_deepspeed == 0 else None
+
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
-    if ckp_data:
-        model.load_state_dict(ckp_data['model'])
-        optimizer.load_state_dict(ckp_data['optimizer'])
-        scaler.load_state_dict(ckp_data['scaler'])
-        start_epoch = ckp_data['epoch']
-        start_step = ckp_data.get('step', 0)
-    
-    # ========== 7. DDP包模型 ==========
-    if dist.is_initialized():
+    wandb_resume_id = None
+    if args.use_deepspeed == 1:
+        deepspeed = require_deepspeed()
+        model, optimizer, _, _ = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            model_parameters=model.parameters(),
+            config=args.ds_config
+        )
+        if args.from_resume == 1:
+            load_path, client_state = load_deepspeed_training_checkpoint(model, ds_checkpoint_dir)
+            if load_path is not None:
+                start_epoch = client_state.get('epoch', 0)
+                start_step = client_state.get('step', 0)
+                wandb_resume_id = client_state.get('wandb_id')
+                saved_ws = client_state.get('world_size')
+                current_ws = dist.get_world_size() if dist.is_initialized() else 1
+                if saved_ws is not None and saved_ws != current_ws and is_main_process():
+                    Logger(f'DeepSpeed检查点 world_size={saved_ws}，当前 world_size={current_ws}，请确认该恢复流程兼容当前并行规模')
+    else:
+        ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
+        if ckp_data:
+            model.load_state_dict(ckp_data['model'])
+            optimizer.load_state_dict(ckp_data['optimizer'])
+            scaler.load_state_dict(ckp_data['scaler'])
+            start_epoch = ckp_data['epoch']
+            start_step = ckp_data.get('step', 0)
+            wandb_resume_id = ckp_data.get('wandb_id')
+
+    # ========== 7. 配wandb & DDP包模型 ==========
+    wandb = init_wandb(wandb_resume_id)
+    if args.use_deepspeed == 0 and dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
-    
+
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(42 + epoch)
+        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-        if skip > 0: 
+        total_steps = len(loader) + skip if skip > 0 else len(loader)
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+        if args.use_deepspeed == 1:
+            train_epoch_deepspeed(epoch, loader, total_steps, start_step=skip, wandb=wandb)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
-    
+            train_epoch_pytorch(epoch, loader, total_steps, start_step=skip, wandb=wandb)
+        start_step = 0
+
     # ========== 9. 清理分布进程 ==========
-    if dist.is_initialized(): dist.destroy_process_group()
+    if wandb and hasattr(wandb, 'finish') and is_main_process():
+        wandb.finish()
+    if dist.is_initialized():
+        dist.destroy_process_group()
