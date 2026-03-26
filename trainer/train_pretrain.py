@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -19,6 +20,7 @@ from trainer.trainer_utils import (
     SkipBatchSampler,
     Logger,
     build_model_config,
+    get_checkpoint_snapshot_name,
     get_deepspeed_zero_stage,
     get_model_config_signature,
     get_lr,
@@ -32,6 +34,8 @@ from trainer.trainer_utils import (
     save_deepspeed_training_checkpoint,
     save_full_weights,
     save_model_config,
+    prune_deepspeed_checkpoint_history,
+    prune_versioned_checkpoint_files,
     setup_seed,
     sync_deepspeed_train_args,
 )
@@ -51,7 +55,7 @@ def init_wandb(resume_id=None):
     if not args.use_wandb or not is_main_process():
         return None
 
-    import swanlab as wandb
+    import wandb
 
     resume = 'must' if resume_id else None
     wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
@@ -78,12 +82,22 @@ def log_train_status(epoch, micro_step, total_steps, processed_steps, loss_value
         })
 
 
-def maybe_save_pytorch_checkpoint(epoch, micro_step, total_steps, model, optimizer, scaler, wandb):
-    if micro_step % args.save_interval != 0 and micro_step != total_steps:
+def should_save_checkpoint(epoch, micro_step, total_steps, global_step):
+    if args.save_by == 'step':
+        return global_step % args.save_interval == 0 or micro_step == total_steps
+
+    if args.save_by == 'epoch':
+        if micro_step != total_steps:
+            return False
+        return (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1
+
+    raise ValueError(f'不支持的保存粒度: {args.save_by}')
+
+
+def maybe_save_pytorch_checkpoint(epoch, micro_step, total_steps, global_step, model, optimizer, scaler, wandb):
+    if not should_save_checkpoint(epoch, micro_step, total_steps, global_step):
         return
 
-    model.eval()
-    save_full_weights(model, args.save_dir, save_filename)
     lm_checkpoint(
         lm_config,
         weight=checkpoint_weight_name,
@@ -92,33 +106,43 @@ def maybe_save_pytorch_checkpoint(epoch, micro_step, total_steps, model, optimiz
         scaler=scaler,
         epoch=epoch,
         step=micro_step,
+        global_step=global_step,
         wandb=wandb,
-        save_dir='../checkpoints'
+        save_dir=args.save_dir,
+        resume_dir='../checkpoints',
+        snapshot_name=get_checkpoint_snapshot_name(args.save_by, epoch, global_step),
+        keep_last=args.max_ckpts,
     )
-    model.train()
 
 
-def maybe_save_deepspeed_checkpoint(epoch, micro_step, total_steps, model_engine, wandb):
-    if micro_step % args.save_interval != 0 and micro_step != total_steps:
+def maybe_save_deepspeed_checkpoint(epoch, micro_step, total_steps, global_step, model_engine, wandb):
+    if not should_save_checkpoint(epoch, micro_step, total_steps, global_step):
         return
     if not model_engine.is_gradient_accumulation_boundary():
         return
 
     model_engine.eval()
+    snapshot_name = get_checkpoint_snapshot_name(args.save_by, epoch, global_step)
     if args.save_full_weights == 1:
-        save_full_weights(model_engine, args.save_dir, save_filename)
+        latest_weight_path = save_full_weights(model_engine, args.save_dir, save_filename)
+        snapshot_weight_path = os.path.join(args.save_dir, f'{checkpoint_weight_name}_{snapshot_name}.pth')
+        if latest_weight_path is not None and snapshot_weight_path != latest_weight_path:
+            shutil.copy2(latest_weight_path, snapshot_weight_path)
+        prune_versioned_checkpoint_files(args.save_dir, checkpoint_weight_name, args.max_ckpts, kind='weight')
 
     client_state = {
         'epoch': epoch,
         'step': micro_step,
+        'global_step': global_step,
         'world_size': dist.get_world_size() if dist.is_initialized() else 1,
     }
     wandb_id = get_wandb_run_id(wandb)
     if wandb_id:
         client_state['wandb_id'] = wandb_id
 
-    tag = f'epoch{epoch + 1}_step{micro_step}'
+    tag = snapshot_name
     save_deepspeed_training_checkpoint(model_engine, ds_checkpoint_dir, tag=tag, client_state=client_state)
+    prune_deepspeed_checkpoint_history(ds_checkpoint_dir, args.max_ckpts)
     model_engine.train()
 
 
@@ -126,6 +150,7 @@ def train_epoch_pytorch(epoch, loader, total_steps, start_step=0, wandb=None):
     start_time = time.time()
     for processed_steps, (input_ids, labels) in enumerate(loader, start=1):
         micro_step = start_step + processed_steps
+        global_step = epoch * total_steps + micro_step
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         lr = get_lr(epoch * total_steps + micro_step, args.epochs * total_steps, args.learning_rate)
@@ -155,7 +180,7 @@ def train_epoch_pytorch(epoch, loader, total_steps, start_step=0, wandb=None):
             log_train_status(epoch, micro_step, total_steps, processed_steps, current_loss, current_aux_loss, current_lr, start_time, wandb)
 
         if is_main_process():
-            maybe_save_pytorch_checkpoint(epoch, micro_step, total_steps, model, optimizer, scaler, wandb)
+            maybe_save_pytorch_checkpoint(epoch, micro_step, total_steps, global_step, model, optimizer, scaler, wandb)
 
         del input_ids, labels, res, loss, raw_loss
 
@@ -164,6 +189,7 @@ def train_epoch_deepspeed(epoch, loader, total_steps, start_step=0, wandb=None):
     start_time = time.time()
     for processed_steps, (input_ids, labels) in enumerate(loader, start=1):
         micro_step = start_step + processed_steps
+        global_step = epoch * total_steps + micro_step
         input_ids = input_ids.to(args.device, non_blocking=True)
         labels = labels.to(args.device, non_blocking=True)
         lr = get_lr(epoch * total_steps + micro_step, args.epochs * total_steps, args.learning_rate)
@@ -182,7 +208,7 @@ def train_epoch_deepspeed(epoch, loader, total_steps, start_step=0, wandb=None):
             current_lr = model.optimizer.param_groups[-1]['lr'] if model.optimizer is not None else lr
             log_train_status(epoch, micro_step, total_steps, processed_steps, current_loss, current_aux_loss, current_lr, start_time, wandb)
 
-        maybe_save_deepspeed_checkpoint(epoch, micro_step, total_steps, model, wandb)
+        maybe_save_deepspeed_checkpoint(epoch, micro_step, total_steps, global_step, model, wandb)
         del input_ids, labels, res, loss
 
 
@@ -201,7 +227,9 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
+    parser.add_argument("--save_by", type=str, default="step", choices=["step", "epoch"], help="checkpoint保存粒度（step=按batch步，epoch=按轮）")
+    parser.add_argument("--save_interval", type=int, default=1000, help="在所选粒度下的保存间隔")
+    parser.add_argument("--max_ckpts", type=int, default=None, help="最多保留的历史checkpoint快照数量；None表示不限制")
     parser.add_argument('--hidden_size', default=None, type=int, help="隐藏层维度，优先级高于model_config")
     parser.add_argument('--intermediate_size', default=None, type=int, help="FFN中间层维度")
     parser.add_argument('--num_hidden_layers', default=None, type=int, help="隐藏层数量，优先级高于model_config")
@@ -279,22 +307,40 @@ if __name__ == "__main__":
     if args.use_compile == 1 and args.use_deepspeed == 0:
         model = torch.compile(model)
         Logger('torch.compile enabled')
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    print(f"[rank {rank}] before dataset", flush=True)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    print(f"[rank {rank}] after dataset", flush=True)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16' and device_type == 'cuda')) if args.use_deepspeed == 0 else None
 
+
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        t = torch.tensor([rank + 1.0], device=args.device)
+        print(f"[rank {rank}] before all_reduce: {t.item()}", flush=True)
+        dist.all_reduce(t)
+        print(f"[rank {rank}] after all_reduce: {t.item()}", flush=True)
+    if args.save_interval < 1:
+        raise ValueError('--save_interval 必须是正整数')
+    if args.max_ckpts is not None and args.max_ckpts < 1:
+        raise ValueError('--max_ckpts 必须是正整数或留空')
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     wandb_resume_id = None
     if args.use_deepspeed == 1:
+
+
         deepspeed = require_deepspeed()
+        print(f"[rank {rank}] before deepspeed.initialize", flush=True)
         model, optimizer, _, _ = deepspeed.initialize(
             model=model,
             optimizer=optimizer,
             model_parameters=model.parameters(),
             config=args.ds_config
         )
+        print(f"[rank {rank}] after deepspeed.initialize", flush=True)
         if args.from_resume == 1:
             load_path, client_state = load_deepspeed_training_checkpoint(model, ds_checkpoint_dir)
             if load_path is not None:

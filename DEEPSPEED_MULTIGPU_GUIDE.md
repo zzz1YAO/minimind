@@ -60,6 +60,7 @@ ds_report
 ```bash
 cat part*.jsonl > pretrain.jsonl
 ```
+3785606条数据，skypile数据集
 
 ### 3.2 先准备模型结构配置和 tokenizer
 

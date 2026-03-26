@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-MODEL_PATH="MiniMind2-0_6B"
+MODEL_PATH="../MiniGPT-0_6B"
 DEVICE="cuda"
 MAX_NEW_TOKENS="1024"
 TEMPERATURE="0.7"

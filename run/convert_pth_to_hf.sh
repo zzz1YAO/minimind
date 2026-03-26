@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# cd "$(dirname "$0")/.."
 
-TORCH_PATH="out/full_sft_1536.pth"
-TRANSFORMERS_PATH="MiniMind2-0_6B"
+TORCH_PATH="../out/pretrain_h1536_l24_a24_kv6_ffn4096_v6400_ctx32768.pth"
+TRANSFORMERS_PATH="../MiniGPT-0_6B"
 MODEL_CONFIG="configs/model/pretrain_0_6b.json"
 TOKENIZER_PATH="model"
 EXPORT_FORMAT="auto"

@@ -337,6 +337,11 @@ python train_pretrain.py
 
 > Execute pretraining to get `pretrain_*.pth` as the output weights for pretraining (where * is the model's dimension, default is 512)
 
+Optional save controls:
+- `--save_by step|epoch`: save history checkpoints by step or by epoch
+- `--save_interval`: save interval under the selected granularity
+- `--max_ckpts N`: keep at most `N` historical checkpoints; omit it to keep all
+
 **3.2 Supervised Fine-tuning (Learning Conversation Style)**
 
 ```bash
@@ -348,7 +353,7 @@ python train_full_sft.py
 <details style="color:rgb(128,128,128)">
 <summary>Note: Training Notes</summary>
 
-By default, all training processes save parameters to the file `./out/***.pth` every 100 steps (each save overwrites the old weights).
+By default, all training processes keep the latest weights in `./out/***.pth`; if history checkpoint saving is enabled, `--save_by` and `--max_ckpts` control the retention policy.
 
 For simplicity, only the two-stage training process is described here. For other training (LoRA, distillation, reinforcement learning, inference fine-tuning, etc.), refer to the detailed description in the [Experiment](#-experiment) section below.
 
@@ -764,8 +769,7 @@ torchrun --nproc_per_node 1 train_pretrain.py # 1 means single GPU training, adj
 python train_pretrain.py
 ```
 
-> After training, model weight files are saved by default every `100 steps` as: `pretrain_*.pth` (where *
-> is the model's specific dimension, new files overwrite old ones on each save)
+> After training, the latest model weights are saved as `pretrain_*.pth`; if you want historical versions, use `--save_by` and `--max_ckpts`.
 
 | MiniMind2-Small (512dim) | MiniMind2 (768dim) |
 |---|---|

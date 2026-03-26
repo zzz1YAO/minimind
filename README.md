@@ -334,6 +334,11 @@ python train_pretrain.py
 
 > 执行预训练，得到 `pretrain_*.pth` 作为预训练的输出权重（其中*为模型的dimension，默认为512）
 
+可选保存参数：
+- `--save_by step|epoch`：按步或按轮保存历史 ckpt
+- `--save_interval`：在所选粒度下的保存间隔
+- `--max_ckpts N`：最多保留 `N` 个历史 ckpt；不传则不限制
+
 
 **3.2 监督微调（学对话方式）**
 
@@ -346,7 +351,7 @@ python train_full_sft.py
 <details style="color:rgb(128,128,128)">
 <summary>注：训练须知</summary>
 
-所有训练过程默认每隔100步保存1次参数到文件`./out/***.pth`（每次会覆盖掉旧权重文件）。
+所有训练过程默认会保存最新参数到文件`./out/***.pth`；如果启用历史 ckpt 保存，则可通过 `--save_by` 和 `--max_ckpts` 控制保留策略。
 
 简单起见，此处只写明两个阶段训练过程。如需其它训练 (LoRA, 蒸馏, 强化学习, 微调推理等) 可参考下文【实验】小节的详细说明。
 
@@ -770,8 +775,7 @@ torchrun --nproc_per_node 1 train_pretrain.py # 1即为单卡训练，可根据�
 python train_pretrain.py
 ```
 
-> 训练后的模型权重文件默认每隔`100步`保存为: `pretrain_*.pth`（*
-> 为模型具体dimension，每次保存时新文件会覆盖旧文件）
+> 训练后的模型权重文件默认保存为最新 `pretrain_*.pth`；如需保留历史版本，可通过 `--save_by` 和 `--max_ckpts` 控制。
 
 
 | MiniMind2-Small (512dim) | MiniMind2 (768dim) |
@@ -1965,5 +1969,3 @@ If you find MiniMind helpful in your research or work, please cite:
 # License
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
-
-

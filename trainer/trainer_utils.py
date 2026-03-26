@@ -2,6 +2,7 @@
 训练工具函数集合
 """
 import os
+import shutil
 import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -15,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from datetime import timedelta
 
 MODEL_CONFIG_DEFAULTS = {
     'hidden_size': 512,
@@ -61,18 +63,22 @@ def get_lr(current_step, total_steps, lr):
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 
-def init_distributed_mode(local_rank=None, backend="nccl"):
+def init_distributed_mode(local_rank=None, backend="nccl", timeout_seconds=120):
     if dist.is_initialized():
         return int(os.environ.get("LOCAL_RANK", local_rank if local_rank is not None else 0))
 
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
 
-    dist.init_process_group(backend=backend)
+    dist.init_process_group(
+        backend=backend,
+        timeout=timedelta(seconds=timeout_seconds),
+    )
     if local_rank is None:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     return local_rank
+
 
 
 def setup_seed(seed: int):
@@ -106,6 +112,14 @@ def get_checkpoint_paths(lm_config, weight='full_sft', save_dir='../checkpoints'
 
 def get_deepspeed_checkpoint_dir(lm_config, weight='pretrain', save_dir='../checkpoints_ds'):
     return os.path.join(save_dir, get_checkpoint_base_name(lm_config, weight))
+
+
+def get_checkpoint_snapshot_name(save_by, epoch, global_step):
+    if save_by == 'epoch':
+        return f'epoch{epoch + 1:04d}'
+    if save_by == 'step':
+        return f'step{global_step:010d}'
+    raise ValueError(f'不支持的保存粒度: {save_by}')
 
 
 def is_deepspeed_active(model):
@@ -267,6 +281,56 @@ def save_full_weights(model, save_dir, save_filename):
     return save_path
 
 
+def prune_versioned_checkpoint_files(save_dir, base_name, keep_last, kind='weight'):
+    if keep_last is None:
+        return
+    if keep_last < 1:
+        raise ValueError('max_ckpts 必须是正整数或 None')
+    if not os.path.isdir(save_dir):
+        return
+
+    if kind == 'weight':
+        candidates = [
+            filename for filename in os.listdir(save_dir)
+            if filename.endswith('.pth')
+            and filename.startswith(f'{base_name}_')
+            and filename != f'{base_name}.pth'
+            and not filename.endswith('_resume.pth')
+        ]
+    elif kind == 'resume':
+        candidates = [
+            filename for filename in os.listdir(save_dir)
+            if filename.endswith('_resume.pth')
+            and filename.startswith(f'{base_name}_')
+            and filename != f'{base_name}_resume.pth'
+        ]
+    else:
+        raise ValueError(f'不支持的 checkpoint 类型: {kind}')
+
+    candidates.sort()
+    for filename in candidates[:-keep_last]:
+        path = os.path.join(save_dir, filename)
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def prune_deepspeed_checkpoint_history(checkpoint_dir, keep_last):
+    if keep_last is None:
+        return
+    if keep_last < 1:
+        raise ValueError('max_ckpts 必须是正整数或 None')
+    if not os.path.isdir(checkpoint_dir):
+        return
+
+    tags = [
+        name for name in os.listdir(checkpoint_dir)
+        if os.path.isdir(os.path.join(checkpoint_dir, name)) and name != 'latest'
+    ]
+    tags.sort()
+    for tag in tags[:-keep_last]:
+        shutil.rmtree(os.path.join(checkpoint_dir, tag), ignore_errors=True)
+
+
 def save_deepspeed_training_checkpoint(model_engine, checkpoint_dir, tag=None, client_state=None):
     os.makedirs(checkpoint_dir, exist_ok=True)
     return model_engine.save_checkpoint(checkpoint_dir, tag=tag, client_state=client_state or {}, save_latest=True)
@@ -280,18 +344,45 @@ def load_deepspeed_training_checkpoint(model_engine, checkpoint_dir, tag=None, *
     return model_engine.load_checkpoint(checkpoint_dir, tag=tag, **kwargs)
 
 
-def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+def lm_checkpoint(
+    lm_config,
+    weight='full_sft',
+    model=None,
+    optimizer=None,
+    epoch=0,
+    step=0,
+    global_step=None,
+    wandb=None,
+    save_dir='../checkpoints',
+    resume_dir=None,
+    snapshot_name=None,
+    keep_last=None,
+    **kwargs
+):
     os.makedirs(save_dir, exist_ok=True)
-    checkpoint_paths = get_checkpoint_paths(lm_config, weight, save_dir)
-    ckp_path = checkpoint_paths['weight_path']
-    resume_path = checkpoint_paths['resume_path']
+    resume_dir = save_dir if resume_dir is None else resume_dir
+    os.makedirs(resume_dir, exist_ok=True)
+
+    base_name = get_checkpoint_base_name(lm_config, weight)
+    latest_weight_path = os.path.join(save_dir, f'{base_name}.pth')
+    latest_resume_path = os.path.join(resume_dir, f'{base_name}_resume.pth')
+    snapshot_weight_path = (
+        os.path.join(save_dir, f'{base_name}_{snapshot_name}.pth')
+        if snapshot_name is not None else None
+    )
+    snapshot_resume_path = (
+        os.path.join(resume_dir, f'{base_name}_{snapshot_name}_resume.pth')
+        if snapshot_name is not None else None
+    )
 
     if model is not None:
         state_dict = unwrap_model(model).state_dict()
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
-        ckp_tmp = ckp_path + '.tmp'
+        ckp_tmp = latest_weight_path + '.tmp'
         torch.save(state_dict, ckp_tmp)
-        os.replace(ckp_tmp, ckp_path)
+        os.replace(ckp_tmp, latest_weight_path)
+        if snapshot_weight_path is not None and snapshot_weight_path != latest_weight_path:
+            shutil.copy2(latest_weight_path, snapshot_weight_path)
         wandb_id = get_wandb_run_id(wandb)
 
         resume_data = {
@@ -299,6 +390,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
             'optimizer': optimizer.state_dict(),
             'epoch': epoch,
             'step': step,
+            'global_step': global_step if global_step is not None else step,
             'world_size': dist.get_world_size() if dist.is_initialized() else 1,
             'wandb_id': wandb_id
         }
@@ -311,14 +403,19 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
                 else:
                     resume_data[key] = value
 
-        resume_tmp = resume_path + '.tmp'
+        resume_tmp = latest_resume_path + '.tmp'
         torch.save(resume_data, resume_tmp)
-        os.replace(resume_tmp, resume_path)
+        os.replace(resume_tmp, latest_resume_path)
+        if snapshot_resume_path is not None and snapshot_resume_path != latest_resume_path:
+            shutil.copy2(latest_resume_path, snapshot_resume_path)
+        if snapshot_name is not None and keep_last is not None:
+            prune_versioned_checkpoint_files(save_dir, base_name, keep_last, kind='weight')
+            prune_versioned_checkpoint_files(resume_dir, base_name, keep_last, kind='resume')
         del state_dict, resume_data
         torch.cuda.empty_cache()
     else:  # 加载模式
-        if os.path.exists(resume_path):
-            ckp_data = torch.load(resume_path, map_location='cpu')
+        if os.path.exists(latest_resume_path):
+            ckp_data = torch.load(latest_resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
             if saved_ws != current_ws:
