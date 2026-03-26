@@ -16,7 +16,8 @@ python trainer/train_pretrain.py \
 --epochs 2 \
 --max_seq_len 1024 \
 --learning_rate 5e-4 \
---save_interval 1000 \
+--save_by epoch \
+--save_interval 1 \
 --log_interval 100 \
 --use_wandb \
 --wandb_project minigpt \
